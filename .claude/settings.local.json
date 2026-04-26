@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ':*)",
+      "Bash(ls /mnt/rl-train/wenhaoli/gdrive/project/spotlight/spotlight/kernel/*.so)"
+    ]
+  }
+}

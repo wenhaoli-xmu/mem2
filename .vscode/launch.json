@@ -1,0 +1,56 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Attach Rank 0",
+            "type": "python",
+            "request": "attach",
+            "connect": {
+                "host": "localhost",
+                "port": 5678
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "Attach Rank 1",
+            "type": "python",
+            "request": "attach",
+            "connect": {
+                "host": "localhost",
+                "port": 5679
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "Attach Rank 2",
+            "type": "python",
+            "request": "attach",
+            "connect": {
+                "host": "localhost",
+                "port": 5680
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "Attach Rank 3",
+            "type": "python",
+            "request": "attach",
+            "connect": {
+                "host": "localhost",
+                "port": 5681
+            },
+            "justMyCode": false
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Debug All 4 Ranks",
+            "configurations": [
+                "Attach Rank 0",
+                "Attach Rank 1",
+                "Attach Rank 2",
+                "Attach Rank 3"
+            ]
+        }
+    ]
+}
