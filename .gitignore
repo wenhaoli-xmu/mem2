@@ -9,3 +9,4 @@ visualize/
 evaluate/ruler/results/
 evaluate/ruler/benchmark_root/
 evaluate/longbench_v2/results/
+*.pdf
