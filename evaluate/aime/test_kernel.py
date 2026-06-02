@@ -21,7 +21,7 @@ import torch
 import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from spotlight import get_monkey_patch, create_lru_caches
+from mem2 import get_monkey_patch, create_lru_caches
 
 
 # ── Think tag utilities ──────────────────────────────────────────────────

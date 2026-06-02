@@ -86,7 +86,7 @@ if __name__ == '__main__':
     import argparse
     import sys
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
-    from spotlight.misc import get_env_conf
+    from mem2.misc import get_env_conf
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", type=str, required=True)

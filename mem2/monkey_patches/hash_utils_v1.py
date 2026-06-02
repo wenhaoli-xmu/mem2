@@ -7,7 +7,7 @@ from queue import SimpleQueue
 from itertools import chain
 from safetensors.torch import load_file
 
-from spotlight.kernel import (
+from mem2.kernel import (
     lru_cache_update_v2 as lru_cache_update,
     hash_packbits,
     hamming_topk_v3,

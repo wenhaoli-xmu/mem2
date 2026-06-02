@@ -1,6 +1,6 @@
-from spotlight import get_monkey_patch, load_checkpoint
-from spotlight.misc import Evaluator, get_env_conf
-from spotlight.eval import test_on_task
+from mem2 import get_monkey_patch, load_checkpoint
+from mem2.misc import Evaluator, get_env_conf
+from mem2.eval import test_on_task
 import argparse
 import torch
 import os

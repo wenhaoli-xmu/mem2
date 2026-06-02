@@ -12,8 +12,8 @@ import argparse
 
 from concurrent.futures import ThreadPoolExecutor
 
-from spotlight import get_monkey_patch
-from spotlight.misc import adjust_lr
+from mem2 import get_monkey_patch
+from mem2.misc import adjust_lr
 
 from transformers import (
     AutoTokenizer,

@@ -1,5 +1,5 @@
 import torch
-from spotlight.kernel import lru_cache_update
+from mem2.kernel import lru_cache_update
 
 def test_lru_kernel():
     B = 1

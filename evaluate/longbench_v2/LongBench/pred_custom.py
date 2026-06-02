@@ -8,8 +8,8 @@ import torch
 import math
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from spotlight.monkey_patches import get_monkey_patch
-from spotlight.monkey_patches.hash_utils import LRUCache, DynamicCache
+from mem2.monkey_patches import get_monkey_patch
+from mem2.monkey_patches.hash_utils import LRUCache, DynamicCache
 
 # LongBench length configuration mapped from the original logic
 model_maxlen = {

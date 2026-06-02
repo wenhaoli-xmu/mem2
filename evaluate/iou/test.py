@@ -6,10 +6,10 @@ import numpy as np
 import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from spotlight.monkey_patches import get_monkey_patch
-from spotlight.monkey_patches.hash_utils import LRUCache, FullCache
-from spotlight.misc import get_env_conf
-from spotlight.data import get_corpus
+from mem2.monkey_patches import get_monkey_patch
+from mem2.monkey_patches.hash_utils import LRUCache, FullCache
+from mem2.misc import get_env_conf
+from mem2.data import get_corpus
 from torch.utils.data import DataLoader
 from itertools import chain
 from pygments.console import colorize
@@ -112,7 +112,7 @@ def test_iou_with_caches(model, tokenizer, caches, task_name, num_instance, trun
                 # Manual IOU calculation for monitoring
                 # We need the key_bins and query projections
                 q_proj0, q_proj1 = past_key_value.query_hash.get_proj_weights()
-                from spotlight.kernel import hash_packbits_hamming
+                from mem2.kernel import hash_packbits_hamming
                 
                 kv_len = torch.tensor(past_key_value.num_tokens, device=q.device, dtype=torch.int32)
                 # Note: hash_packbits_hamming computes counts of matching bits

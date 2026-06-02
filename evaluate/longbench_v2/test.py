@@ -8,7 +8,7 @@ from datasets import load_dataset
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from spotlight import get_monkey_patch, load_checkpoint, create_lru_caches
+from mem2 import get_monkey_patch, load_checkpoint, create_lru_caches
 
 # ── prompt templates (loaded relative to this script) ──────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))

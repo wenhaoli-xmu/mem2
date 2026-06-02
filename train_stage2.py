@@ -9,10 +9,10 @@ from functools import partial
 import tqdm
 import argparse
 
-from spotlight import get_monkey_patch, load_checkpoint
-from spotlight.monkey_patches import get_monkey_patch
-from spotlight.misc import adjust_lr
-from spotlight.monkey_patches.ulysses_utils import dist_seq
+from mem2 import get_monkey_patch, load_checkpoint
+from mem2.monkey_patches import get_monkey_patch
+from mem2.misc import adjust_lr
+from mem2.monkey_patches.ulysses_utils import dist_seq
 
 from transformers import (
     AutoTokenizer,

@@ -4,7 +4,7 @@ import os
 import torch.distributed as dist
 
 from functools import partial
-from spotlight.misc import adjust_lr
+from mem2.misc import adjust_lr
 
 from transformers import AutoConfig
 from safetensors.torch import save_file

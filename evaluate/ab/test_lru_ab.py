@@ -14,7 +14,7 @@ from non-deterministic parallel duplicate handling.
 
 import torch
 import numpy as np
-from spotlight.kernel import lru_cache_update
+from mem2.kernel import lru_cache_update
 
 
 class PythonLRUCache:

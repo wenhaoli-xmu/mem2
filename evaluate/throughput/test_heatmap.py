@@ -4,8 +4,8 @@ Measures decode latency (ms/token) with first 3 layers.
 Tests ours (LRUCache) fully, then baseline (FA2 + StaticCache) fully.
 Uses true next-token (argmax) for autoregressive decode.
 """
-from spotlight import get_monkey_patch
-from spotlight.monkey_patches.hash_utils import LRUCache, CacheList
+from mem2 import get_monkey_patch
+from mem2.monkey_patches.hash_utils import LRUCache, CacheList
 import argparse, csv, torch, time, os, gc, copy
 import numpy as np
 from transformers import AutoModelForCausalLM, StaticCache, DynamicCache, AutoConfig, AutoTokenizer

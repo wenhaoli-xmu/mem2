@@ -6,17 +6,17 @@ import numpy as np
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from spotlight import get_monkey_patch, load_checkpoint, create_lru_caches
+from mem2 import get_monkey_patch, load_checkpoint, create_lru_caches
 
-from spotlight.misc import get_env_conf
-from spotlight.data import get_corpus
+from mem2.misc import get_env_conf
+from mem2.data import get_corpus
 from torch.utils.data import DataLoader
 from itertools import chain
 import tqdm
 import math
 import heapq
 
-from spotlight.eval import perplexity
+from mem2.eval import perplexity
 from utils import plot_ppl_curve
 
 
