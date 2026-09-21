@@ -1,9 +1,9 @@
-from mem2 import get_monkey_patch
+from routecache import get_monkey_patch
 import argparse
 import torch
 
 from transformers import AutoModelForCausalLM, StaticCache, AutoConfig, AutoTokenizer
-from mem2.monkey_patches.hash_utils import LRUCache, TopkCache
+from routecache.monkey_patches.hash_utils import LRUCache, TopkCache
 from profiler import WallTime
 from torch.profiler import profile, ProfilerActivity
 

@@ -14,7 +14,7 @@ from non-deterministic parallel duplicate handling.
 
 import torch
 import numpy as np
-from mem2.kernel import lru_cache_update
+from routecache.kernel import lru_cache_update
 
 
 class PythonLRUCache:

@@ -19,7 +19,7 @@ and async_update_stream, the async version will produce:
 import torch
 import time
 import numpy as np
-from mem2.monkey_patches.hash_utils import LRUCache
+from routecache.monkey_patches.hash_utils import LRUCache
 
 
 def copy_hash_weights(src: LRUCache, dst: LRUCache):

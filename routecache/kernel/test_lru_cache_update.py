@@ -1,5 +1,5 @@
 import torch
-from mem2.kernel import lru_cache_update
+from routecache.kernel import lru_cache_update
 
 def test_lru_kernel():
     B = 1

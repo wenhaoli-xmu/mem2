@@ -5,7 +5,7 @@ import os
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 
-from mem2.kernel import (
+from routecache.kernel import (
     hash_packbits,
     hash_packbits_hamming,
 )

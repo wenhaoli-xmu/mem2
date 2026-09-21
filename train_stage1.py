@@ -12,8 +12,8 @@ import argparse
 
 from concurrent.futures import ThreadPoolExecutor
 
-from mem2 import get_monkey_patch
-from mem2.misc import adjust_lr
+from routecache import get_monkey_patch
+from routecache.misc import adjust_lr
 
 from transformers import (
     AutoTokenizer,

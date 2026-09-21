@@ -5,7 +5,7 @@ import torch.distributed as dist
 from itertools import chain
 from safetensors.torch import load_file
 
-from mem2.kernel import (
+from routecache.kernel import (
     fifo_cache_update,
     lru_cache_update,
     hash_packbits,

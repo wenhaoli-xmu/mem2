@@ -9,10 +9,10 @@ from functools import partial
 import tqdm
 import argparse
 
-from mem2 import get_monkey_patch, load_checkpoint
-from mem2.monkey_patches import get_monkey_patch
-from mem2.misc import adjust_lr
-from mem2.monkey_patches.ulysses_utils import dist_seq
+from routecache import get_monkey_patch, load_checkpoint
+from routecache.monkey_patches import get_monkey_patch
+from routecache.misc import adjust_lr
+from routecache.monkey_patches.ulysses_utils import dist_seq
 
 from transformers import (
     AutoTokenizer,
