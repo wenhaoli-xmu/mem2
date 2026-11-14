@@ -1,0 +1,8 @@
+[
+    {
+        "task_type": "ppl",
+        "task_name": "pg19.prolong",
+        "num_instance": 1,
+        "truncation": 256000
+    }
+]
