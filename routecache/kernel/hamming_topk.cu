@@ -6,368 +6,205 @@
 #include <stdexcept>
 
 namespace {
+constexpr int DP = 4, CM = 128;
 
-constexpr int D_PACK = 4;      // D=128 -> 4 int32 words
-constexpr int CHUNK_MAX = 128; // max BLOCK_N/2 when BLOCK_N in {64,128,256}
-
-__device__ __forceinline__ bool is_aligned_16(const void* ptr) {
-    return ((reinterpret_cast<uintptr_t>(ptr) & 0xF) == 0);
-}
+__device__ __forceinline__ bool a16(const void* p) { return !(reinterpret_cast<uintptr_t>(p) & 0xF); }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-__device__ __forceinline__ uint32_t smem_addr_u32(const void* ptr) {
-    return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+__device__ __forceinline__ uint32_t sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+__device__ __forceinline__ void cpa(void* d, const void* s) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa(d)), "l"(s));
 }
-
-__device__ __forceinline__ void cp_async_cg_16B(void* smem_ptr, const void* gmem_ptr) {
-    uint32_t smem_addr = smem_addr_u32(smem_ptr);
-    asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], 16;\n" ::
-        "r"(smem_addr), "l"(gmem_ptr)
-    );
-}
-
-__device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
-}
-
-__device__ __forceinline__ void cp_async_wait_all() {
-    asm volatile("cp.async.wait_group 0;\n" ::);
-}
+__device__ __forceinline__ void cpc() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void cpw() { asm volatile("cp.async.wait_group 0;\n" ::); }
 #endif
 
-template<int BLOCK_N, int THREADS, bool USE_CP_ASYNC>
-__global__ void phase1_qpacked_kernel(
-    const int32_t* __restrict__ q_packed,   // [B, KH, G, D_PACK]
-    const int32_t* __restrict__ key_bins,   // [B, MaxT, KH, D_PACK]
-    int16_t* __restrict__ block_vals,       // [B, KH, n_blocks, BLOCK_N]
-    int32_t* __restrict__ block_idxs,       // [B, KH, n_blocks, BLOCK_N]
-    const int32_t* __restrict__ kv_length_ptr,
-    int B, int MaxT, int KHv, int Gv, int n_blocks
-) {
-    constexpr int CHUNK = BLOCK_N / 2;
+template <int BN, int NT, bool CA>
+__global__ void p1k(const int32_t* __restrict__ qp, const int32_t* __restrict__ kb, int16_t* __restrict__ bv,
+                    int32_t* __restrict__ bi, const int32_t* __restrict__ kl,
+                    int B, int MT, int KH, int G, int nb) {
+    constexpr int CH = BN / 2;
+    int i = blockIdx.x, nbi = i % nb, kh = i / nb % KH, b = i / nb / KH;
+    int ka = *kl;
+    ka = ka < 0 ? 0 : (ka > MT ? MT : ka);
+    int ns = nbi * BN;
 
-    int linear_idx = blockIdx.x;
-    int n_block_idx = linear_idx % n_blocks;
-    linear_idx /= n_blocks;
-    int kv_head = linear_idx % KHv;
-    int b = linear_idx / KHv;
+    extern __shared__ char sm[];
+    int32_t* qs = reinterpret_cast<int32_t*>(sm);
+    int32_t* kbuf = qs + G * DP;
+    int16_t* bs = reinterpret_cast<int16_t*>(kbuf + 2 * CM * DP);
+    int32_t* bp = reinterpret_cast<int32_t*>(bs + BN);
 
-    int KN_active = *kv_length_ptr;
-    if (KN_active < 0) KN_active = 0;
-    if (KN_active > MaxT) KN_active = MaxT;
-
-    int n_start = n_block_idx * BLOCK_N;
-
-    extern __shared__ char shared_raw[];
-    int32_t* q_shared = reinterpret_cast<int32_t*>(shared_raw);                               // [G * D_PACK]
-    int32_t* k_buf = q_shared + Gv * D_PACK;                                                   // [2 * CHUNK_MAX * D_PACK]
-    int16_t* block_scores = reinterpret_cast<int16_t*>(k_buf + 2 * CHUNK_MAX * D_PACK);       // [BLOCK_N]
-    int32_t* block_positions = reinterpret_cast<int32_t*>(block_scores + BLOCK_N);            // [BLOCK_N]
-
-    for (int i = threadIdx.x; i < Gv * D_PACK; i += THREADS) {
-        q_shared[i] = q_packed[(((size_t)b * KHv * Gv * D_PACK) + (size_t)kv_head * Gv * D_PACK) + i];
-    }
+    for (int x = threadIdx.x; x < G * DP; x += NT)
+        qs[x] = qp[(size_t)b * KH * G * DP + (size_t)kh * G * DP + x];
     __syncthreads();
 
-    auto load_chunk = [&](int stage, int chunk_base, int chunk_tokens) {
-        size_t k_base = (size_t)b * MaxT * KHv * D_PACK + (size_t)kv_head * D_PACK;
-        for (int t = threadIdx.x; t < chunk_tokens; t += THREADS) {
-            int ng = n_start + chunk_base + t;
-            int32_t* dst = &k_buf[(stage * CHUNK_MAX + t) * D_PACK];
-
-            if (ng < KN_active) {
-                const int32_t* src = key_bins + k_base + (size_t)ng * KHv * D_PACK;
-                bool can_vec16 = (D_PACK == 4) && is_aligned_16(src) && is_aligned_16(dst);
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-                if constexpr (USE_CP_ASYNC) {
-                    if (can_vec16) {
-                        cp_async_cg_16B(dst, src);
-                    } else {
-                        #pragma unroll
-                        for (int di = 0; di < D_PACK; di++) dst[di] = src[di];
-                    }
-                } else {
-                    if (can_vec16) {
-                        int4 v = *reinterpret_cast<const int4*>(src);
-                        *reinterpret_cast<int4*>(dst) = v;
-                    } else {
-                        #pragma unroll
-                        for (int di = 0; di < D_PACK; di++) dst[di] = src[di];
-                    }
-                }
-#else
-                if (can_vec16) {
-                    int4 v = *reinterpret_cast<const int4*>(src);
-                    *reinterpret_cast<int4*>(dst) = v;
-                } else {
-                    #pragma unroll
-                    for (int di = 0; di < D_PACK; di++) dst[di] = src[di];
-                }
-#endif
-            } else {
+    auto load = [&](int st, int cb, int ct) {
+        size_t base = (size_t)b * MT * KH * DP + (size_t)kh * DP;
+        for (int t = threadIdx.x; t < ct; t += NT) {
+            int ng = ns + cb + t;
+            int32_t* d = &kbuf[(st * CM + t) * DP];
+            if (ng >= ka) {
                 #pragma unroll
-                for (int di = 0; di < D_PACK; di++) dst[di] = 0;
+                for (int j = 0; j < DP; j++) d[j] = 0;
+                continue;
             }
-        }
-
+            const int32_t* s = kb + base + (size_t)ng * KH * DP;
+            if (!(DP == 4 && a16(s) && a16(d))) {
+                #pragma unroll
+                for (int j = 0; j < DP; j++) d[j] = s[j];
+                continue;
+            }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-        if constexpr (USE_CP_ASYNC) {
-            cp_async_commit();
+            if constexpr (CA) cpa(d, s);
+            else *reinterpret_cast<int4*>(d) = *reinterpret_cast<const int4*>(s);
+#else
+            *reinterpret_cast<int4*>(d) = *reinterpret_cast<const int4*>(s);
+#endif
         }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+        if constexpr (CA) cpc();
 #endif
     };
 
-    int stage = 0;
-    int first_tokens = (BLOCK_N < CHUNK) ? BLOCK_N : CHUNK;
-    load_chunk(stage, 0, first_tokens);
+    int st = 0, ft = BN < CH ? BN : CH;
+    load(st, 0, ft);
 
-    for (int chunk_base = 0; chunk_base < BLOCK_N; chunk_base += CHUNK) {
-        int chunk_tokens = BLOCK_N - chunk_base;
-        if (chunk_tokens > CHUNK) chunk_tokens = CHUNK;
-
+    for (int cb = 0; cb < BN; cb += CH) {
+        int ct = BN - cb;
+        if (ct > CH) ct = CH;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-        if constexpr (USE_CP_ASYNC) {
-            cp_async_wait_all();
-        }
+        if constexpr (CA) cpw();
 #endif
         __syncthreads();
 
-        int next_base = chunk_base + CHUNK;
-        if (next_base < BLOCK_N) {
-            int next_tokens = BLOCK_N - next_base;
-            if (next_tokens > CHUNK) next_tokens = CHUNK;
-            load_chunk(stage ^ 1, next_base, next_tokens);
+        int nxb = cb + CH;
+        if (nxb < BN) {
+            int nt2 = BN - nxb;
+            if (nt2 > CH) nt2 = CH;
+            load(st ^ 1, nxb, nt2);
         }
 
-        for (int t = threadIdx.x; t < chunk_tokens; t += THREADS) {
-            int nl = chunk_base + t;
-            int n = n_start + nl;
-
-            int16_t my_score;
-            if (n < KN_active) {
-                int accum = 0;
-                int32_t* kh = &k_buf[(stage * CHUNK_MAX + t) * D_PACK];
-
+        for (int t = threadIdx.x; t < ct; t += NT) {
+            int nl = cb + t, n = ns + nl;
+            int16_t sc;
+            if (n < ka) {
+                int a = 0;
+                int32_t* c = &kbuf[(st * CM + t) * DP];
                 #pragma unroll
                 for (int g = 0; g < 4; g++) {
-                    if (g < Gv) {
-                        int32_t* qh = &q_shared[g * D_PACK];
-                        accum += __popc(~(qh[0] ^ kh[0]));
-                        accum += __popc(~(qh[1] ^ kh[1]));
-                        accum += __popc(~(qh[2] ^ kh[2]));
-                        accum += __popc(~(qh[3] ^ kh[3]));
-                    }
+                    if (g >= G) continue;
+                    int32_t* h = &qs[g * DP];
+                    a += __popc(~(h[0] ^ c[0])) + __popc(~(h[1] ^ c[1]))
+                       + __popc(~(h[2] ^ c[2])) + __popc(~(h[3] ^ c[3]));
                 }
-                my_score = static_cast<int16_t>(accum);
+                sc = (int16_t)a;
             } else {
-                my_score = static_cast<int16_t>(-32768);
+                sc = (int16_t)-32768;
             }
-
-            block_scores[nl] = my_score;
-            block_positions[nl] = n;
+            bs[nl] = sc;
+            bp[nl] = n;
         }
-
         __syncthreads();
-        stage ^= 1;
+        st ^= 1;
     }
 
-    size_t out_base = (((size_t)b * KHv + kv_head) * n_blocks + n_block_idx) * BLOCK_N;
-    for (int i = threadIdx.x; i < BLOCK_N; i += THREADS) {
-        block_vals[out_base + i] = block_scores[i];
-        block_idxs[out_base + i] = block_positions[i];
+    size_t ob = ((size_t)b * KH + kh) * nb * BN;
+    for (int x = threadIdx.x; x < BN; x += NT) {
+        bv[ob + x] = bs[x];
+        bi[ob + x] = bp[x];
     }
 }
 
-template<int THREADS>
-__global__ void phase2_kernel(
-    const int16_t* __restrict__ block_vals,
-    const int32_t* __restrict__ block_idxs,
-    int64_t* __restrict__ topk_out,
-    int B, int KHv, int n_blocks, int local_k, int top_budget
-) {
-    int linear_idx = blockIdx.x;
-    int kv_head = linear_idx % KHv;
-    int b = linear_idx / KHv;
+template <int NT>
+__global__ void p2k(const int16_t* __restrict__ bv, const int32_t* __restrict__ bi, int64_t* __restrict__ tk,
+                    int B, int KH, int nb, int lk, int tb) {
+    int i = blockIdx.x, kh = i % KH, b = i / KH, tc = nb * lk;
+    size_t ib = ((size_t)b * KH + kh) * tc, ob = ((size_t)b * KH + kh) * tb;
+    constexpr int HS = 1024;
+    __shared__ int h[HS];
+    __shared__ int16_t th;
+    __shared__ int op;
 
-    int total_candidates = n_blocks * local_k;
-    size_t in_base = ((size_t)b * KHv + kv_head) * (size_t)total_candidates;
-    size_t out_base = ((size_t)b * KHv + kv_head) * top_budget;
-
-    constexpr int HIST_SIZE = 1024;
-    __shared__ int histogram[HIST_SIZE];
-    __shared__ int16_t threshold;
-    __shared__ int out_pos;
-
-    for (int i = threadIdx.x; i < HIST_SIZE; i += THREADS) histogram[i] = 0;
+    for (int x = threadIdx.x; x < HS; x += NT) h[x] = 0;
     __syncthreads();
-
-    for (int i = threadIdx.x; i < total_candidates; i += THREADS) {
-        int s = static_cast<int>(block_vals[in_base + i]);
-        int bin = s;
-        if (bin < 0) bin = 0;
-        if (bin >= HIST_SIZE) bin = HIST_SIZE - 1;
-        atomicAdd(&histogram[bin], 1);
+    for (int x = threadIdx.x; x < tc; x += NT) {
+        int s = bv[ib + x];
+        s = s < 0 ? 0 : (s >= HS ? HS - 1 : s);
+        atomicAdd(&h[s], 1);
     }
     __syncthreads();
-
-    if (threadIdx.x == 0) {
-        int cumsum = 0;
-        threshold = 0;
-        for (int bin = HIST_SIZE - 1; bin >= 0; --bin) {
-            cumsum += histogram[bin];
-            if (cumsum >= top_budget) {
-                threshold = static_cast<int16_t>(bin);
-                break;
-            }
+    if (!threadIdx.x) {
+        int cs = 0;
+        th = 0;
+        for (int k = HS - 1; k >= 0; k--) {
+            cs += h[k];
+            if (cs >= tb) { th = (int16_t)k; break; }
         }
-        out_pos = 0;
+        op = 0;
     }
     __syncthreads();
-
-    for (int i = threadIdx.x; i < total_candidates; i += THREADS) {
-        if (block_vals[in_base + i] > threshold) {
-            int pos = atomicAdd(&out_pos, 1);
-            if (pos < top_budget) topk_out[out_base + pos] = static_cast<int64_t>(block_idxs[in_base + i]);
-        }
+    for (int x = threadIdx.x; x < tc; x += NT) {
+        if (bv[ib + x] <= th) continue;
+        int p = atomicAdd(&op, 1);
+        if (p < tb) tk[ob + p] = (int64_t)bi[ib + x];
     }
     __syncthreads();
-
-    for (int i = threadIdx.x; i < total_candidates; i += THREADS) {
-        if (block_vals[in_base + i] == threshold) {
-            int pos = atomicAdd(&out_pos, 1);
-            if (pos < top_budget) topk_out[out_base + pos] = static_cast<int64_t>(block_idxs[in_base + i]);
-        }
+    for (int x = threadIdx.x; x < tc; x += NT) {
+        if (bv[ib + x] != th) continue;
+        int p = atomicAdd(&op, 1);
+        if (p < tb) tk[ob + p] = (int64_t)bi[ib + x];
     }
 }
 
-template<int BLOCK_N, int THREADS, bool USE_CP_ASYNC>
-torch::Tensor launch_qpacked_topk(
-    torch::Tensor q_packed,
-    torch::Tensor key_bins,
-    torch::Tensor kv_length,
-    int top_budget
-) {
-    int B = q_packed.size(0);
-    int KHv = q_packed.size(1);
-    int Gv = q_packed.size(2);
-    int MaxT = key_bins.size(1);
-    int n_blocks = (MaxT + BLOCK_N - 1) / BLOCK_N;
+template <int BN, int NT, bool CA>
+torch::Tensor lq(torch::Tensor qp, torch::Tensor kb, torch::Tensor kl, int tb) {
+    int B = qp.size(0), KH = qp.size(1), G = qp.size(2), MT = kb.size(1), nb = (MT + BN - 1) / BN;
+    auto st = at::cuda::getCurrentCUDAStream();
+    auto bv = torch::empty({B, KH, nb, BN}, qp.options().dtype(torch::kInt16));
+    auto bi = torch::empty({B, KH, nb, BN}, qp.options().dtype(torch::kInt32));
+    auto tk = torch::full({B, KH, tb}, -1, qp.options().dtype(torch::kInt64));
 
-    auto device = q_packed.device();
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    auto block_vals = torch::empty({B, KHv, n_blocks, BLOCK_N}, torch::dtype(torch::kInt16).device(device));
-    auto block_idxs = torch::empty({B, KHv, n_blocks, BLOCK_N}, torch::dtype(torch::kInt32).device(device));
-    auto topk_out = torch::full({B, KHv, top_budget}, -1, torch::dtype(torch::kInt64).device(device));
-
-    int grid_p1 = B * KHv * n_blocks;
-    size_t smem_p1 = (Gv * D_PACK) * sizeof(int32_t)
-                   + (2 * CHUNK_MAX * D_PACK) * sizeof(int32_t)
-                   + BLOCK_N * sizeof(int16_t)
-                   + BLOCK_N * sizeof(int32_t);
-
-    phase1_qpacked_kernel<BLOCK_N, THREADS, USE_CP_ASYNC><<<grid_p1, THREADS, smem_p1, stream>>>(
-        q_packed.data_ptr<int32_t>(),
-        key_bins.data_ptr<int32_t>(),
-        block_vals.data_ptr<int16_t>(),
-        block_idxs.data_ptr<int32_t>(),
-        kv_length.data_ptr<int32_t>(),
-        B, MaxT, KHv, Gv, n_blocks
-    );
-
-    int grid_p2 = B * KHv;
-    phase2_kernel<256><<<grid_p2, 256, 0, stream>>>(
-        block_vals.data_ptr<int16_t>(),
-        block_idxs.data_ptr<int32_t>(),
-        topk_out.data_ptr<int64_t>(),
-        B, KHv, n_blocks, BLOCK_N, top_budget
-    );
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err));
-    }
-
-    return topk_out;
+    size_t sm = (G * DP) * 4 + (2 * CM * DP) * 4 + BN * 2 + BN * 4;
+    p1k<BN, NT, CA><<<B * KH * nb, NT, sm, st>>>(
+        qp.data_ptr<int32_t>(), kb.data_ptr<int32_t>(), bv.data_ptr<int16_t>(), bi.data_ptr<int32_t>(),
+        kl.data_ptr<int32_t>(), B, MT, KH, G, nb);
+    p2k<256><<<B * KH, 256, 0, st>>>(bv.data_ptr<int16_t>(), bi.data_ptr<int32_t>(),
+                                     tk.data_ptr<int64_t>(), B, KH, nb, BN, tb);
+    if (auto e = cudaGetLastError(); e) throw std::runtime_error(cudaGetErrorString(e));
+    return tk;
 }
 
-torch::Tensor hamming_topk_from_qpacked_cfg(
-    torch::Tensor q_packed,
-    torch::Tensor key_bins,
-    torch::Tensor kv_length,
-    int top_budget,
-    int block_n,
-    int threads,
-    bool use_cp_async
-) {
-    TORCH_CHECK(q_packed.is_cuda(), "q_packed must be CUDA");
-    TORCH_CHECK(key_bins.is_cuda(), "key_bins must be CUDA");
-    TORCH_CHECK(kv_length.is_cuda(), "kv_length must be CUDA");
+torch::Tensor hamming_topk_from_qpacked_cfg(torch::Tensor qp, torch::Tensor kb, torch::Tensor kl,
+                                            int tb, int bn, int nt, bool ca) {
+    TORCH_CHECK(qp.is_cuda() && kb.is_cuda() && kl.is_cuda());
+    TORCH_CHECK(qp.scalar_type() == torch::kInt32 && kb.scalar_type() == torch::kInt32 &&
+                kl.scalar_type() == torch::kInt32);
+    TORCH_CHECK(qp.dim() == 4 && kb.dim() == 4);
+    qp = qp.contiguous(); kb = kb.contiguous(); kl = kl.contiguous();
 
-    TORCH_CHECK(q_packed.scalar_type() == torch::kInt32, "q_packed must be int32");
-    TORCH_CHECK(key_bins.scalar_type() == torch::kInt32, "key_bins must be int32");
-    TORCH_CHECK(kv_length.scalar_type() == torch::kInt32, "kv_length must be int32");
+    int B = qp.size(0), KH = qp.size(1), G = qp.size(2), DPq = qp.size(3);
+    TORCH_CHECK(DPq == DP && kb.size(0) == B && kb.size(2) == KH && kb.size(3) == DP);
+    TORCH_CHECK(G >= 1 && G <= 4);
 
-    TORCH_CHECK(q_packed.dim() == 4, "q_packed must be [B,KH,G,D_PACK]");
-    TORCH_CHECK(key_bins.dim() == 4, "key_bins must be [B,MaxT,KH,D_PACK]");
-
-    q_packed = q_packed.contiguous();
-    key_bins = key_bins.contiguous();
-    kv_length = kv_length.contiguous();
-
-    int B = q_packed.size(0);
-    int KHv = q_packed.size(1);
-    int Gv = q_packed.size(2);
-    int DP = q_packed.size(3);
-    TORCH_CHECK(DP == D_PACK, "q_packed D_PACK mismatch");
-    TORCH_CHECK(key_bins.size(0) == B, "B mismatch");
-    TORCH_CHECK(key_bins.size(2) == KHv, "KH mismatch");
-    TORCH_CHECK(key_bins.size(3) == D_PACK, "key_bins D_PACK mismatch");
-    TORCH_CHECK(Gv >= 1 && Gv <= 4, "G out of supported range");
-
-    if (block_n == 64 && threads == 128) {
-        if (use_cp_async) return launch_qpacked_topk<64, 128, true>(q_packed, key_bins, kv_length, top_budget);
-        else return launch_qpacked_topk<64, 128, false>(q_packed, key_bins, kv_length, top_budget);
-    } else if (block_n == 64 && threads == 256) {
-        if (use_cp_async) return launch_qpacked_topk<64, 256, true>(q_packed, key_bins, kv_length, top_budget);
-        else return launch_qpacked_topk<64, 256, false>(q_packed, key_bins, kv_length, top_budget);
-    } else if (block_n == 128 && threads == 128) {
-        if (use_cp_async) return launch_qpacked_topk<128, 128, true>(q_packed, key_bins, kv_length, top_budget);
-        else return launch_qpacked_topk<128, 128, false>(q_packed, key_bins, kv_length, top_budget);
-    } else if (block_n == 128 && threads == 256) {
-        if (use_cp_async) return launch_qpacked_topk<128, 256, true>(q_packed, key_bins, kv_length, top_budget);
-        else return launch_qpacked_topk<128, 256, false>(q_packed, key_bins, kv_length, top_budget);
-    } else if (block_n == 256 && threads == 128) {
-        if (use_cp_async) return launch_qpacked_topk<256, 128, true>(q_packed, key_bins, kv_length, top_budget);
-        else return launch_qpacked_topk<256, 128, false>(q_packed, key_bins, kv_length, top_budget);
-    } else if (block_n == 256 && threads == 256) {
-        if (use_cp_async) return launch_qpacked_topk<256, 256, true>(q_packed, key_bins, kv_length, top_budget);
-        else return launch_qpacked_topk<256, 256, false>(q_packed, key_bins, kv_length, top_budget);
-    }
-
-    TORCH_CHECK(false, "Unsupported (block_n, threads) config");
+    #define GO(BN, NT) return ca ? lq<BN, NT, true>(qp, kb, kl, tb) : lq<BN, NT, false>(qp, kb, kl, tb)
+    if (bn == 64 && nt == 128) GO(64, 128);
+    if (bn == 64 && nt == 256) GO(64, 256);
+    if (bn == 128 && nt == 128) GO(128, 128);
+    if (bn == 128 && nt == 256) GO(128, 256);
+    if (bn == 256 && nt == 128) GO(256, 128);
+    if (bn == 256 && nt == 256) GO(256, 256);
+    #undef GO
+    TORCH_CHECK(false);
 }
 
-torch::Tensor hamming_topk_from_qpacked(
-    torch::Tensor q_packed,
-    torch::Tensor key_bins,
-    torch::Tensor kv_length,
-    int top_budget
-) {
-    return hamming_topk_from_qpacked_cfg(
-        q_packed, key_bins, kv_length, top_budget, 128, 256, true
-    );
+torch::Tensor hamming_topk_from_qpacked(torch::Tensor qp, torch::Tensor kb, torch::Tensor kl, int tb) {
+    return hamming_topk_from_qpacked_cfg(qp, kb, kl, tb, 128, 256, true);
 }
 
-} // namespace
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("hamming_topk_from_qpacked", &hamming_topk_from_qpacked,
-          "Hamming+TopK from pre-packed query bits");
-    m.def("hamming_topk_from_qpacked_cfg", &hamming_topk_from_qpacked_cfg,
-          "Configurable Hamming+TopK from pre-packed query bits",
-          py::arg("q_packed"), py::arg("key_bins"), py::arg("kv_length"),
-          py::arg("top_budget"), py::arg("block_n"), py::arg("threads"), py::arg("use_cp_async"));
+    m.def("hamming_topk_from_qpacked", &hamming_topk_from_qpacked);
+    m.def("hamming_topk_from_qpacked_cfg", &hamming_topk_from_qpacked_cfg);
 }

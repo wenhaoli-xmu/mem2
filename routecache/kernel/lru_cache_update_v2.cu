@@ -5,369 +5,175 @@
 #include <cstdint>
 #include <ATen/cuda/CUDAContext.h>
 
-// ============================================================
-// lru_cache_update_v2: Optimized over v1
-//   1. Phase 3: Bitonic sort O(cache * log²cache) replaces
-//      serial O(num_misses * cache) victim finding
-//   2. Phase 4: Parallel metadata update (all threads, not tid==0)
-// ============================================================
+#define WR(p) (reinterpret_cast<float4*>(&(p))[0])
+#define RD(p) (reinterpret_cast<const float4*>(&(p))[0])
+#define EMPTY -1
+#define INV 0x7FFFFFFF
 
-#define BF16X8_WRITE(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
-#define BF16X8_READ(pointer)  (reinterpret_cast<const float4*>(&(pointer))[0])
+__device__ __forceinline__ int hf(int k, int m) { return ((unsigned)k * 2654435761u) & m; }
 
-constexpr int EMPTY_SLOT    = -1;
-constexpr int INVALID_TIME  = 0x7FFFFFFF;
-
-__device__ __forceinline__ int hash_func(int key, int mask) {
-    return ((unsigned int)key * 2654435761u) & mask;
-}
-
-// -----------------------------------------------------------------
-// Bitonic compare-and-swap (ascending sort by key)
-// -----------------------------------------------------------------
-__device__ __forceinline__ void bitonic_cas(
-    int* keys, int* vals, int i, int j, bool ascending
-) {
-    int ki = keys[i], kj = keys[j];
-    int vi = vals[i], vj = vals[j];
-    bool swap = ascending ? (ki > kj) : (ki < kj);
-    if (swap) {
-        keys[i] = kj; keys[j] = ki;
-        vals[i] = vj; vals[j] = vi;
+__device__ __forceinline__ void cas(int* k, int* v, int i, int j, bool up) {
+    int a = k[i], b = k[j];
+    if (up ? a > b : a < b) {
+        k[i] = b; k[j] = a;
+        int x = v[i]; v[i] = v[j]; v[j] = x;
     }
 }
 
-template <int HASH_TABLE_SIZE>
-__global__ void optimized_lru_update_v2_kernel(
-    const int64_t*      __restrict__ topk_indices,   // [B, KH, top_budget]
-    int*                __restrict__ lru_indices,     // [B, KH, allocated_size]
-    int*                __restrict__ lru_timestamps,  // [B, KH, allocated_size]
-    int*                __restrict__ current_time,    // [B, KH]
-    const __nv_bfloat16* __restrict__ global_k,
-    const __nv_bfloat16* __restrict__ global_v,
-    __nv_bfloat16*       __restrict__ cache_k,
-    __nv_bfloat16*       __restrict__ cache_v,
-    float*               __restrict__ hit_rates,
-    const int B, const int KH,
-    const int cache_size,        // active LRU slots
-    const int allocated_size,    // total allocated (>= cache_size)
-    const int top_budget,
-    const int D, const int MaxT
-) {
-    // -----------------------------------------------------------
-    // 0. Setup
-    // -----------------------------------------------------------
-    constexpr int HASH_MASK = HASH_TABLE_SIZE - 1;
-    int b        = blockIdx.x;
-    int head_idx = blockIdx.y;
-    int tid      = threadIdx.x;
-    int batch_head_idx = b * KH + head_idx;
+template <int TS>
+__global__ void lk2(const int64_t* __restrict__ tk, int* __restrict__ li, int* __restrict__ lt,
+                    int* __restrict__ ct, const __nv_bfloat16* __restrict__ gk,
+                    const __nv_bfloat16* __restrict__ gv, __nv_bfloat16* __restrict__ ck,
+                    __nv_bfloat16* __restrict__ cv, float* __restrict__ hr,
+                    int B, int KH, int CS, int AS, int TB, int D, int MT) {
+    constexpr int M = TS - 1;
+    int b = blockIdx.x, h = blockIdx.y, t = threadIdx.x, bh = b * KH + h;
 
-    extern __shared__ char shared_mem[];
+    extern __shared__ char sm[];
+    int* ht = reinterpret_cast<int*>(sm);
+    int* hv = ht + TS;
+    int* mi = hv + TS;
+    int* mc = mi + TB;
+    int* hc = mc + 1;
+    int* bt = hc + 1;
 
-    // ---- Shared memory layout (Phase 1-2) ----
-    // [hash_table: HTS] [hash_values: HTS] [miss_indices: top_budget]
-    //  [miss_count: 1] [hit_count: 1] [global_base_time: 1]
-    int* hash_table  = reinterpret_cast<int*>(shared_mem);
-    int* hash_values = hash_table + HASH_TABLE_SIZE;
-    int* s_miss_indices = hash_values + HASH_TABLE_SIZE;
-    int* s_miss_count      = s_miss_indices + top_budget;
-    int* s_hit_count       = s_miss_count + 1;
-    int* s_global_base_time = s_hit_count + 1;
-
-    // Initialize counters
-    if (tid == 0) {
-        *s_miss_count = 0;
-        *s_hit_count  = 0;
-        *s_global_base_time = 0;
-    }
-
-    // Clear hash table
-    for (int i = tid; i < HASH_TABLE_SIZE; i += blockDim.x) {
-        hash_table[i]  = EMPTY_SLOT;
-        hash_values[i] = EMPTY_SLOT;
-    }
+    if (!t) { *mc = 0; *hc = 0; *bt = 0; }
+    for (int i = t; i < TS; i += blockDim.x) { ht[i] = EMPTY; hv[i] = EMPTY; }
     __syncthreads();
 
-    int* g_lru_idx = lru_indices    + (batch_head_idx * allocated_size);
-    int* g_lru_ts  = lru_timestamps + (batch_head_idx * allocated_size);
+    int* gi = li + bh * AS;
+    int* gt = lt + bh * AS;
 
-    // -----------------------------------------------------------
-    // Phase 1: Build hash table from current LRU cache
-    // -----------------------------------------------------------
-    for (int i = tid; i < cache_size; i += blockDim.x) {
-        int token_idx = g_lru_idx[i];
-        if (token_idx >= 0) {
-            int h = hash_func(token_idx, HASH_MASK);
-            while (true) {
-                int old = atomicCAS(&hash_values[h], EMPTY_SLOT, token_idx);
-                if (old == EMPTY_SLOT || old == token_idx) {
-                    if (old == EMPTY_SLOT) hash_table[h] = i;
-                    break;
-                }
-                h = (h + 1) & HASH_MASK;
+    for (int i = t; i < CS; i += blockDim.x) {
+        int x = gi[i];
+        if (x < 0) continue;
+        for (int p = hf(x, M);; p = (p + 1) & M) {
+            int o = atomicCAS(&hv[p], EMPTY, x);
+            if (o == EMPTY || o == x) {
+                if (o == EMPTY) ht[p] = i;
+                break;
             }
         }
     }
     __syncthreads();
 
-    // -----------------------------------------------------------
-    // Phase 2: Classify topk as hit / miss
-    // -----------------------------------------------------------
-    const int64_t* my_topk = topk_indices + (batch_head_idx * top_budget);
-
-    // Per-thread hit buffer (register)
-    int my_hit_pos[32];
-    int my_hit_rank[32];
-    int my_n_hits = 0;
-
-    for (int i = tid; i < top_budget; i += blockDim.x) {
-        int cand = static_cast<int>(my_topk[i]);
-        if (cand < 0) continue;
-
-        int h = hash_func(cand, HASH_MASK);
-        int cache_pos = -1;
-        while (hash_values[h] != EMPTY_SLOT) {
-            if (hash_values[h] == cand) { cache_pos = hash_table[h]; break; }
-            h = (h + 1) & HASH_MASK;
+    const int64_t* tp = tk + bh * TB;
+    int hp[32], hrn[32], nh = 0;
+    for (int i = t; i < TB; i += blockDim.x) {
+        int x = (int)tp[i];
+        if (x < 0) continue;
+        int p = hf(x, M), cp = -1;
+        while (hv[p] != EMPTY) {
+            if (hv[p] == x) { cp = ht[p]; break; }
+            p = (p + 1) & M;
         }
-
-        if (cache_pos >= 0) {
-            if (my_n_hits < 32) {
-                my_hit_pos[my_n_hits]  = cache_pos;
-                my_hit_rank[my_n_hits] = atomicAdd(s_hit_count, 1);
-                my_n_hits++;
-            }
+        if (cp >= 0) {
+            if (nh < 32) { hp[nh] = cp; hrn[nh] = atomicAdd(hc, 1); nh++; }
         } else {
-            int mi = atomicAdd(s_miss_count, 1);
-            s_miss_indices[mi] = cand;
+            mi[atomicAdd(mc, 1)] = x;
         }
     }
     __syncthreads();
 
-    int num_misses = *s_miss_count;
-    int num_hits   = *s_hit_count;
-
-    // Report hit rate & allocate timestamps for hits
-    if (tid == 0) {
-        int total = num_hits + num_misses;
-        hit_rates[batch_head_idx] = (total > 0) ? (float)num_hits / total : 0.0f;
-        if (num_hits > 0) {
-            *s_global_base_time = atomicAdd(&current_time[batch_head_idx], num_hits);
-        }
+    int nm = *mc, nhit = *hc;
+    if (!t) {
+        int tot = nhit + nm;
+        hr[bh] = tot > 0 ? (float)nhit / tot : 0.f;
+        if (nhit > 0) *bt = atomicAdd(&ct[bh], nhit);
     }
     __syncthreads();
 
-    // Write hit timestamps to global memory (parallel)
-    int base_time = *s_global_base_time;
-    for (int k = 0; k < my_n_hits; k++) {
-        g_lru_ts[my_hit_pos[k]] = base_time + my_hit_rank[k] + 1;
+    int base = *bt;
+    for (int k = 0; k < nh; k++) gt[hp[k]] = base + hrn[k] + 1;
+    __syncthreads();
+    if (nm == 0) return;
+
+    __shared__ int ibt;
+    if (!t) ibt = atomicAdd(&ct[bh], nm) + 1;
+
+    int N = 1;
+    while (N < CS) N <<= 1;
+    int* st = ht;
+    int* sp = st + N;
+
+    for (int i = t; i < CS; i += blockDim.x) {
+        st[i] = gi[i] < 0 ? INV : gt[i];
+        sp[i] = i;
     }
+    for (int i = CS + t; i < N; i += blockDim.x) { st[i] = INV; sp[i] = -1; }
     __syncthreads();
 
-    if (num_misses == 0) return;
-
-    // -----------------------------------------------------------
-    // Phase 3: Batch victim finding via bitonic sort
-    //   Sort (timestamp, position) pairs ascending by timestamp.
-    //   The first num_misses entries are victims.
-    //   Reuse hash_table / hash_values memory for sort arrays.
-    // -----------------------------------------------------------
-    __shared__ int s_insert_base_time;
-    if (tid == 0) {
-        s_insert_base_time = atomicAdd(&current_time[batch_head_idx], num_misses) + 1;
-    }
-
-    // Compute sort_N = smallest power-of-2 >= cache_size
-    int sort_N = 1;
-    while (sort_N < cache_size) sort_N <<= 1;
-
-    // Reuse hash area (2 * HASH_TABLE_SIZE ints) for sort buffers
-    // sort_ts and sort_pos each need sort_N ints
-    // 2*sort_N <= 2*cache_size <= HASH_TABLE_SIZE <= 2*HASH_TABLE_SIZE  ✓
-    int* sort_ts  = hash_table;            // reuse
-    int* sort_pos = hash_table + sort_N;   // right after sort_ts
-
-    // Load timestamps (with updated hit timestamps visible after sync)
-    for (int i = tid; i < cache_size; i += blockDim.x) {
-        int idx = g_lru_idx[i];
-        int ts  = g_lru_ts[i];
-        sort_ts[i]  = (idx < 0) ? INVALID_TIME : ts;
-        sort_pos[i] = i;
-    }
-    // Pad to sort_N with sentinel values
-    for (int i = cache_size + tid; i < sort_N; i += blockDim.x) {
-        sort_ts[i]  = INVALID_TIME;
-        sort_pos[i] = -1;
-    }
-    __syncthreads();
-
-    // Bitonic sort — ascending by timestamp
-    for (int size = 2; size <= sort_N; size <<= 1) {
-        for (int stride = size >> 1; stride > 0; stride >>= 1) {
-            for (int i = tid; i < sort_N; i += blockDim.x) {
-                int j = i ^ stride;
-                if (j > i) {
-                    bool ascending = ((i & size) == 0);
-                    bitonic_cas(sort_ts, sort_pos, i, j, ascending);
-                }
+    for (int sz = 2; sz <= N; sz <<= 1)
+        for (int sd = sz >> 1; sd > 0; sd >>= 1) {
+            for (int i = t; i < N; i += blockDim.x) {
+                int j = i ^ sd;
+                if (j > i) cas(st, sp, i, j, !(i & sz));
             }
             __syncthreads();
         }
-    }
 
-    // sort_pos[0 .. num_misses-1] are the victim cache positions
-    // (smallest timestamps = least recently used)
-
-    // -----------------------------------------------------------
-    // Phase 4: Update metadata — PARALLEL (all threads)
-    // -----------------------------------------------------------
-    __syncthreads();
-    int ins_base = s_insert_base_time;
-
-    for (int i = tid; i < num_misses; i += blockDim.x) {
-        int victim_pos    = sort_pos[i];
-        int new_token_idx = s_miss_indices[i];
-        if (victim_pos >= 0) {
-            g_lru_idx[victim_pos] = new_token_idx;
-            g_lru_ts[victim_pos]  = ins_base + i;
-        }
+    int ib = ibt;
+    for (int i = t; i < nm; i += blockDim.x) {
+        int p = sp[i];
+        if (p >= 0) { gi[p] = mi[i]; gt[p] = ib + i; }
     }
     __syncthreads();
 
-    // -----------------------------------------------------------
-    // Phase 5: Vectorized K/V copy (BF16 × 8 per iteration)
-    // -----------------------------------------------------------
-    int D_vec = D / 8;
-    int total_tasks = num_misses * D_vec;
+    int dv = D / 8, tot = nm * dv;
+    for (int x = t; x < tot; x += blockDim.x) {
+        int u = x / dv, d = (x % dv) * 8, tok = mi[u], p = sp[u];
+        if (p < 0) continue;
+        long s = ((long)b * MT * KH * D) + ((long)tok * KH * D) + ((long)h * D) + d;
+        long o = ((long)b * AS * KH * D) + ((long)p * KH * D) + ((long)h * D) + d;
+        WR(ck[o]) = RD(gk[s]);
+        WR(cv[o]) = RD(gv[s]);
+    }
+}
 
-    for (int task_id = tid; task_id < total_tasks; task_id += blockDim.x) {
-        int miss_idx  = task_id / D_vec;
-        int d_vec_idx = task_id % D_vec;
-        int d_offset  = d_vec_idx * 8;
+torch::Tensor lru_update_v2_cuda(torch::Tensor tk, torch::Tensor li, torch::Tensor lt, torch::Tensor ct,
+                                 torch::Tensor gk, torch::Tensor gv, torch::Tensor ck, torch::Tensor cv,
+                                 int CS, int TB) {
+    TORCH_CHECK(gk.scalar_type() == torch::kBFloat16 && ck.scalar_type() == torch::kBFloat16);
+    TORCH_CHECK(lt.scalar_type() == torch::kInt32);
 
-        int token_global = s_miss_indices[miss_idx];
-        int write_pos    = sort_pos[miss_idx];   // read directly from sort result
+    int B = tk.size(0), KH = tk.size(1), MT = gk.size(1), D = gk.size(3), AS = ck.size(1);
+    int hs = 1024;
+    for (int s : {1024, 2048, 4096, 8192}) if (CS * 2 > s) hs = s * 2;
+    TORCH_CHECK(CS <= hs / 2);
 
-        if (write_pos >= 0) {
-            long src_off = ((long)b * MaxT * KH * D)
-                         + ((long)token_global * KH * D)
-                         + ((long)head_idx * D)
-                         + d_offset;
+    auto hr = torch::empty({B, KH}, tk.options().dtype(torch::kFloat32));
+    size_t sm = hs * 2 * sizeof(int) + TB * sizeof(int) + 128 * sizeof(int);
+    auto st = at::cuda::getCurrentCUDAStream();
 
-            long dst_off = ((long)b * allocated_size * KH * D)
-                         + ((long)write_pos * KH * D)
-                         + ((long)head_idx * D)
-                         + d_offset;
+    #define GO(S) lk2<S><<<dim3(B, KH), 256, sm, st>>>(tk.data_ptr<int64_t>(), li.data_ptr<int>(), lt.data_ptr<int>(), \
+        ct.data_ptr<int>(), reinterpret_cast<const __nv_bfloat16*>(gk.data_ptr<at::BFloat16>()), \
+        reinterpret_cast<const __nv_bfloat16*>(gv.data_ptr<at::BFloat16>()), \
+        reinterpret_cast<__nv_bfloat16*>(ck.data_ptr<at::BFloat16>()), \
+        reinterpret_cast<__nv_bfloat16*>(cv.data_ptr<at::BFloat16>()), \
+        hr.data_ptr<float>(), B, KH, CS, AS, TB, D, MT)
 
-            float4 kv;
-            kv = BF16X8_READ(global_k[src_off]);
-            BF16X8_WRITE(cache_k[dst_off]) = kv;
-
-            kv = BF16X8_READ(global_v[src_off]);
-            BF16X8_WRITE(cache_v[dst_off]) = kv;
+    if (sm > 48 * 1024) {
+        int dev, mx;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&mx, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        if (sm <= (size_t)mx) {
+            if (hs == 1024) cudaFuncSetAttribute(lk2<1024>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+            if (hs == 2048) cudaFuncSetAttribute(lk2<2048>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+            if (hs == 4096) cudaFuncSetAttribute(lk2<4096>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+            if (hs == 8192) cudaFuncSetAttribute(lk2<8192>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+            if (hs == 16384) cudaFuncSetAttribute(lk2<16384>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
         }
     }
-}
 
-// -----------------------------------------------------------------
-// Host wrapper
-// -----------------------------------------------------------------
-torch::Tensor lru_update_v2_cuda(
-    torch::Tensor topk_indices,
-    torch::Tensor lru_indices,
-    torch::Tensor lru_timestamps,
-    torch::Tensor current_time,
-    torch::Tensor global_k,
-    torch::Tensor global_v,
-    torch::Tensor cache_k,
-    torch::Tensor cache_v,
-    int cache_size,
-    int top_budget
-) {
-    TORCH_CHECK(global_k.scalar_type() == torch::kBFloat16);
-    TORCH_CHECK(cache_k.scalar_type()  == torch::kBFloat16);
-    TORCH_CHECK(lru_timestamps.scalar_type() == torch::kInt32);
-
-    const int B   = topk_indices.size(0);
-    const int KH  = topk_indices.size(1);
-    const int MaxT = global_k.size(1);
-    const int D    = global_k.size(3);
-    const int allocated_size = cache_k.size(1);
-
-    // Choose hash table size (power of 2, >= 2 * cache_size)
-    int hash_size = 1024;
-    if      (cache_size * 2 > 8192) hash_size = 16384;
-    else if (cache_size * 2 > 4096) hash_size = 8192;
-    else if (cache_size * 2 > 2048) hash_size = 4096;
-    else if (cache_size * 2 > 1024) hash_size = 2048;
-
-    TORCH_CHECK(cache_size <= hash_size / 2, "cache_size too large for compiled hash sizes");
-
-    auto hit_rates = torch::empty({B, KH}, topk_indices.options().dtype(torch::kFloat32));
-
-    dim3 grid(B, KH);
-    int threads = 256;
-
-    // Shared memory:
-    //   hash area  : 2 * hash_size * sizeof(int)   (reused for sort in Phase 3)
-    //   miss array : top_budget * sizeof(int)
-    //   counters   : 3 * sizeof(int)
-    size_t smem_size = (hash_size * 2 * sizeof(int))
-                     + (top_budget * sizeof(int))
-                     + (128 * sizeof(int));   // counters + padding
-
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    if (smem_size > 48 * 1024) {
-        int device;
-        cudaGetDevice(&device);
-        int max_smem;
-        cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-
-        #define SET_SMEM(SIZE) \
-            cudaFuncSetAttribute(optimized_lru_update_v2_kernel<SIZE>, \
-                cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-
-        if ((size_t)max_smem >= smem_size) {
-            switch(hash_size) {
-                case 1024:  SET_SMEM(1024);  break;
-                case 2048:  SET_SMEM(2048);  break;
-                case 4096:  SET_SMEM(4096);  break;
-                case 8192:  SET_SMEM(8192);  break;
-                case 16384: SET_SMEM(16384); break;
-            }
-        }
-        #undef SET_SMEM
+    switch (hs) {
+        case 1024: GO(1024); break;
+        case 2048: GO(2048); break;
+        case 4096: GO(4096); break;
+        case 8192: GO(8192); break;
+        case 16384: GO(16384); break;
+        default: TORCH_CHECK(false);
     }
-
-    #define LAUNCH(SIZE) \
-        optimized_lru_update_v2_kernel<SIZE><<<grid, threads, smem_size, stream>>>( \
-            topk_indices.data_ptr<int64_t>(), \
-            lru_indices.data_ptr<int>(), \
-            lru_timestamps.data_ptr<int>(), \
-            current_time.data_ptr<int>(), \
-            reinterpret_cast<const __nv_bfloat16*>(global_k.data_ptr<at::BFloat16>()), \
-            reinterpret_cast<const __nv_bfloat16*>(global_v.data_ptr<at::BFloat16>()), \
-            reinterpret_cast<__nv_bfloat16*>(cache_k.data_ptr<at::BFloat16>()), \
-            reinterpret_cast<__nv_bfloat16*>(cache_v.data_ptr<at::BFloat16>()), \
-            hit_rates.data_ptr<float>(), \
-            B, KH, cache_size, allocated_size, top_budget, D, MaxT \
-        );
-
-    switch (hash_size) {
-        case 1024:  LAUNCH(1024);  break;
-        case 2048:  LAUNCH(2048);  break;
-        case 4096:  LAUNCH(4096);  break;
-        case 8192:  LAUNCH(8192);  break;
-        case 16384: LAUNCH(16384); break;
-        default: TORCH_CHECK(false, "Unsupported hash size");
-    }
-    #undef LAUNCH
-
-    return hit_rates;
+    return hr;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("update", &lru_update_v2_cuda, "LRU Cache Update v2 (bitonic sort victim finding)");
-}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("update", &lru_update_v2_cuda); }
